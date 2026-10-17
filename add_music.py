@@ -25,6 +25,17 @@ for i,freq in enumerate(notes):
     tone=.055*env*(np.sin(2*np.pi*freq*x)+.2*np.sin(2*np.pi*freq*2*x))
     pan=.3+.4*(i%3)/2
     left[mask]+=tone*(1-pan);right[mask]+=tone*pan
+# Quiet transition sound design: filtered air swells and a soft low impact.
+for cut in [7,19,28,35,43,50,56]:
+    first=max(0,int((cut-.6)*sr)); last=min(len(t),int((cut+.9)*sr))
+    x=t[first:last]-cut
+    air=rng.normal(0,1,len(x))
+    air=np.convolve(air,np.ones(55)/55,mode='same')
+    envelope=np.exp(-(x/.32)**2)
+    whoosh=.055*air*envelope
+    hit=.035*np.sin(2*np.pi*55*np.maximum(x,0))*np.exp(-np.maximum(x,0)*9)*(x>=0)
+    left[first:last]+=whoosh+hit
+    right[first:last]+=whoosh[::-1]+hit
 fade=np.minimum(1,t/3)*np.minimum(1,(seconds-t)/4)
 audio=np.stack([left*fade,right*fade],axis=1)
 (root/'media').mkdir(exist_ok=True)
