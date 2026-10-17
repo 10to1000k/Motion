@@ -16,13 +16,51 @@ art=ROOT/'assets/art'
 images={name:Image.open(art/(name+'.jpg')).convert('RGB').resize((1080,1080),Image.Resampling.LANCZOS) for name in ['origin','zurvan','duality','world']}
 # Narrative cuts have independent camera directions, animated foregrounds and dissolves.
 scenes=[(0,7,'origin'),(7,19,'zurvan'),(19,28,'duality'),(28,35,'origin'),(35,43,'zurvan'),(43,50,'world'),(50,56,'origin'),(56,60,'zurvan')]
+def animate_art(name,t):
+    """Locally advect the artwork itself, not just camera or overlay particles.
+
+    Shared mesh vertices prevent seams. Boundary falloff prevents black edges;
+    the portrait face and hand regions are excluded from the motion field.
+    """
+    def point(x,y):
+        edge=max(0,math.sin(math.pi*x/1080))*max(0,math.sin(math.pi*y/1080))
+        if name in ('origin','duality'):
+            dx=x-540; dy=y-470; radius=math.hypot(dx,dy)
+            strength=.055 if name=='origin' else .085
+            angle=strength*math.sin(t*.85-radius/165)*edge
+            nx=540+dx*math.cos(angle)-dy*math.sin(angle)
+            ny=470+dx*math.sin(angle)+dy*math.cos(angle)
+            return nx+8*edge*math.sin(y/95+t),ny+6*edge*math.cos(x/110-t*.8)
+        if name=='zurvan':
+            # Keep facial features and fingers completely still. Animate beard tips
+            # and fabric on the outer shoulders independently of the camera.
+            beard=math.exp(-((x-540)/105)**4-((y-520)/100)**4)
+            cloth=math.exp(-((y-785)/210)**4)*(1-math.exp(-((x-540)/230)**4))
+            protected=1
+            for hx,hy in [(390,570),(650,760)]:
+                protected*=1-math.exp(-((x-hx)/130)**4-((y-hy)/125)**4)
+            amount=(beard*8+cloth*13)*edge*protected
+            return x+amount*math.sin(t*1.4+y/95), y+amount*.35*math.sin(t*1.1+x/110)
+        # Architecture stays rigid; sky flows and foreground sand ripples.
+        sky=max(0,min(1,(390-y)/160))
+        sand=max(0,min(1,(y-700)/170))
+        return x+edge*(sky*17*math.sin(t*.6+y/130)+sand*13*math.sin(t*1.4+y/70)),y+edge*sand*4*math.sin(t*1.8+x/90)
+    mesh=[]
+    step=40
+    for y in range(0,1080,step):
+        for x in range(0,1080,step):
+            r=min(1080,x+step); b=min(1080,y+step)
+            quad=(*point(x,y),*point(x,b),*point(r,b),*point(r,y))
+            mesh.append(((x,y,r,b),quad))
+    return images[name].transform((1080,1080),Image.Transform.MESH,mesh,Image.Resampling.BICUBIC)
+
 def shot(index,t):
     start,end,name=scenes[index]; u=max(0,min(1,(t-start)/(end-start)))
     smooth=u*u*(3-2*u)
     scale=1.03+.09*(smooth if index%2==0 else 1-smooth)
     side=int(1080/scale)
     x=int((1080-side)*(.25+.5*smooth)); y=int((1080-side)*(.35 if name=='zurvan' else .6))
-    return images[name].crop((x,y,x+side,y+side)).resize((W,H),Image.Resampling.BICUBIC).convert('RGBA')
+    return animate_art(name,t).crop((x,y,x+side,y+side)).resize((W,H),Image.Resampling.BICUBIC).convert('RGBA')
 
 # Soft darkening at the base keeps Persian titles readable.
 grad=np.zeros((1080,1080,4),dtype=np.uint8)
