@@ -1,144 +1,281 @@
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np, math, random, subprocess, wave
+"""Zurvan: a 60-second square film built mostly from time-varying geometry.
+No stock footage is used. Artwork is confined to two portrait inserts and ruins.
+Run from the repository root; then run add_music.py once.
+"""
 from pathlib import Path
+import math, subprocess, argparse
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import arabic_reshaper
 from bidi.algorithm import get_display
 import imageio_ffmpeg
 
 ROOT=Path(__file__).parent
-W=H=1080; FPS=24; DURATION=60
-ff=imageio_ffmpeg.get_ffmpeg_exe()
-font=lambda size: ImageFont.truetype(str(ROOT/'assets/Vazirmatn-Regular.ttf'),size)
+W=H=1080; FPS=24
+GOLD=(223,179,103); WHITE=(246,231,202); BLUE=(127,169,224)
+FONTS={n:ImageFont.truetype(str(ROOT/'assets/Vazirmatn-Regular.ttf'),n) for n in [19,23,27,33,44,54,76,112]}
 def rtl(s): return get_display(arabic_reshaper.reshape(s))
-def text(draw,s,y,size,color=(237,216,167,255)):
-    draw.text((540,y),rtl(s),font=font(size),fill=color,anchor='mt')
-art=ROOT/'assets/art'
-images={name:Image.open(art/(name+'.jpg')).convert('RGB').resize((1080,1080),Image.Resampling.LANCZOS) for name in ['origin','zurvan','duality','world']}
-# Narrative cuts have independent camera directions, animated foregrounds and dissolves.
-scenes=[(0,7,'origin'),(7,19,'zurvan'),(19,28,'duality'),(28,35,'origin'),(35,43,'zurvan'),(43,50,'world'),(50,56,'origin'),(56,60,'zurvan')]
-def animate_art(name,t):
-    """Locally advect the artwork itself, not just camera or overlay particles.
+def label(d,s,x,y,size=44,color=WHITE,anchor='mt'):
+    d.text((x,y),rtl(s),font=FONTS[size],fill=color,anchor=anchor)
+def smooth(x):
+    x=max(0,min(1,x));return x*x*(3-2*x)
+def rgba(color,a): return (*color,max(0,min(255,int(a))))
+rng=np.random.default_rng(123)
+yy,xx=np.mgrid[:1080,:1080]
+r=np.sqrt(((xx-540)/800)**2+((yy-430)/850)**2)
+noise=rng.normal(0,.85,(1080,1080))
+bg=np.stack([7+7*np.exp(-r*r*3)+noise,12+9*np.exp(-r*r*3)+noise,23+13*np.exp(-r*r*3)+noise],axis=-1)
+BACKGROUND=Image.fromarray(np.uint8(np.clip(bg,0,255))).convert('RGBA')
+ART={n:Image.open(ROOT/'assets/art'/f'{n}.jpg').convert('RGB') for n in ['zurvan','world']}
+stars=rng.random((420,5)); particles=rng.random((650,5)); dust=rng.random((280,4))
+# The narrative alternates scale and form rather than repeating a single layout.
+SHOTS=[(0,3,'seed','پیش از جهان، زمان بود','بی‌آغاز • بی‌پایان'),
+(3,7,'vortex','زمانِ بی‌کران',''),
+(7,13,'portrait','زَروان','روایتی از ایران باستان'),
+(13,19,'hourglass','فراتر از روز و شب','نه پادشاه؛ سرچشمه‌ای اسطوره‌ای'),
+(19,24,'duality','روشنایی و تاریکی','دو نیرو، در روایت زَروانی'),
+(24,28,'duality','از یک سرچشمه','اهورامزدا و اهریمن'),
+(28,35,'branches','یک روایت، نه تمام تاریخ','زَروانی‌گری؛ نه باور همهٔ زرتشتیان'),
+(35,40,'portrait','چهره‌ای برای بی‌کرانگی','تصویری نمادین و خیالی'),
+(40,45,'sphere','ستارگان می‌چرخند','روز به شب می‌رسد'),
+(45,50,'ruins','و آدمی می‌گذرد',''),
+(50,56,'hourglass','زمان در ماست؟','یا ما در زمان زندگی می‌کنیم؟'),
+(56,60,'ending','زَروان','پدرِ اسطوره‌ایِ زمانِ بی‌کران')]
 
-    Shared mesh vertices prevent seams. Boundary falloff prevents black edges;
-    the portrait face and hand regions are excluded from the motion field.
-    """
-    def point(x,y):
-        edge=max(0,math.sin(math.pi*x/1080))*max(0,math.sin(math.pi*y/1080))
-        if name in ('origin','duality'):
-            dx=x-540; dy=y-470; radius=math.hypot(dx,dy)
-            strength=.055 if name=='origin' else .085
-            angle=strength*math.sin(t*.85-radius/165)*edge
-            nx=540+dx*math.cos(angle)-dy*math.sin(angle)
-            ny=470+dx*math.sin(angle)+dy*math.cos(angle)
-            return nx+8*edge*math.sin(y/95+t),ny+6*edge*math.cos(x/110-t*.8)
-        if name=='zurvan':
-            # Keep facial features and fingers completely still. Animate beard tips
-            # and fabric on the outer shoulders independently of the camera.
-            beard=math.exp(-((x-540)/105)**4-((y-520)/100)**4)
-            cloth=math.exp(-((y-785)/210)**4)*(1-math.exp(-((x-540)/230)**4))
-            protected=1
-            for hx,hy in [(390,570),(650,760)]:
-                protected*=1-math.exp(-((x-hx)/130)**4-((y-hy)/125)**4)
-            amount=(beard*8+cloth*13)*edge*protected
-            return x+amount*math.sin(t*1.4+y/95), y+amount*.35*math.sin(t*1.1+x/110)
-        # Architecture stays rigid; sky flows and foreground sand ripples.
-        sky=max(0,min(1,(390-y)/160))
-        sand=max(0,min(1,(y-700)/170))
-        return x+edge*(sky*17*math.sin(t*.6+y/130)+sand*13*math.sin(t*1.4+y/70)),y+edge*sand*4*math.sin(t*1.8+x/90)
-    mesh=[]
-    step=40
-    for y in range(0,1080,step):
-        for x in range(0,1080,step):
-            r=min(1080,x+step); b=min(1080,y+step)
-            quad=(*point(x,y),*point(x,b),*point(r,b),*point(r,y))
-            mesh.append(((x,y,r,b),quad))
-    return images[name].transform((1080,1080),Image.Transform.MESH,mesh,Image.Resampling.BICUBIC)
+def starfield(d,t,zoom=1):
+    for u,v,z,phase,size in stars:
+        # Radial travel in depth, not a flat texture translated across the frame.
+        depth=.25+((z+t*.018)%1)*1.8
+        x=540+(u-.5)*1500/depth*zoom; y=455+(v-.5)*1250/depth*zoom
+        if 45<x<1035 and 45<y<1010:
+            a=45+100*(.5+.5*math.sin(t*.8+phase*7))
+            rad=.6+size/depth
+            d.ellipse((x-rad,y-rad,x+rad,y+rad),fill=rgba(WHITE,a))
 
-def shot(index,t):
-    start,end,name=scenes[index]; u=max(0,min(1,(t-start)/(end-start)))
-    smooth=u*u*(3-2*u)
-    scale=1.03+.09*(smooth if index%2==0 else 1-smooth)
-    side=int(1080/scale)
-    x=int((1080-side)*(.25+.5*smooth)); y=int((1080-side)*(.35 if name=='zurvan' else .6))
-    return animate_art(name,t).crop((x,y,x+side,y+side)).resize((W,H),Image.Resampling.BICUBIC).convert('RGBA')
+def orbit(d,t,cx=540,cy=435,scale=1):
+    for j in range(4):
+        points=[]
+        ang=j*.62+t*.1
+        for k in range(181):
+            a=2*math.pi*k/180
+            x=math.cos(a)*(285+j*25)*scale
+            y=math.sin(a)*(100+j*21)*scale
+            points.append((cx+x*math.cos(ang)-y*math.sin(ang),cy+x*math.sin(ang)+y*math.cos(ang)))
+        d.line(points,fill=rgba(GOLD,65+j*18),width=1)
+        a=t*(.45+j*.13)+j
+        x=math.cos(a)*(285+j*25)*scale;y=math.sin(a)*(100+j*21)*scale
+        px=cx+x*math.cos(ang)-y*math.sin(ang);py=cy+x*math.sin(ang)+y*math.cos(ang)
+        d.ellipse((px-4,py-4,px+4,py+4),fill=rgba(WHITE,230))
 
-# Soft darkening at the base keeps Persian titles readable.
-grad=np.zeros((1080,1080,4),dtype=np.uint8)
-for y in range(1080): grad[y,:,3]=int(max(0,(y-560)/520)*224)
-shade=Image.fromarray(grad)
-chapters=[(0,7,'پیش از جهان، زمان بود','بی‌آغاز • بی‌پایان'),(7,19,'زَروان','زمانِ بی‌کران'),(19,28,'روشنایی و تاریکی','دو نیرو، در روایت زَروانی'),(28,35,'یک روایت، نه تمام تاریخ','زَروانی‌گری؛ یکی از سنت‌های دینی ایران'),(35,43,'چهره‌ای برای بی‌کرانگی','تصویری نمادین و خیالی'),(43,50,'همه‌چیز می‌گذرد','ستارگان، روزها، آدمیان'),(50,56,'زمان در ماست؟','یا ما در زمان زندگی می‌کنیم؟'),(56,60,'زَروان','پدرِ اسطوره‌ایِ زمانِ بی‌کران')]
-cards=[]
-for start,end,title,sub in chapters:
-    card=Image.new('RGBA',(W,H)); d=ImageDraw.Draw(card)
-    d.line((450,806,630,806),fill=(201,162,88,220),width=2)
-    text(d,title,836,76 if title=='زَروان' else 47)
-    text(d,sub,934,27,(216,207,189,255))
-    cards.append((start,end,card))
-random.seed(42)
-stars=[(random.uniform(50,1030),random.uniform(65,790),random.uniform(.5,2),random.random()*6.28,random.uniform(5,17)) for _ in range(85)]
-Path('deliverables').mkdir(exist_ok=True)
-cmd=[ff,'-y','-f','rawvideo','-vcodec','rawvideo','-pix_fmt','rgb24','-s','1080x1080','-r',str(FPS),'-i','-','-i','assets/audio/narration.flac','-filter_complex','[1:a]adelay=700|700,apad,afade=t=out:st=59:d=1[a]','-map','0:v','-map','[a]','-t','60','-c:v','libx264','-preset','fast','-crf','20','-pix_fmt','yuv420p','-c:a','aac','-b:a','192k','-movflags','+faststart','deliverables/zurvan-instagram.mp4']
-p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=open('render.log','w'))
-for n in range(FPS*DURATION):
-    t=n/FPS
-    index=next(i for i,(start,end,name) in enumerate(scenes) if start<=t<end)
-    frame=shot(index,t)
-    start,end,name=scenes[index]
-    if index>0 and t-start<.85:
-        mix=(t-start)/.85; mix=mix*mix*(3-2*mix)
-        frame=Image.blend(shot(index-1,t),frame,mix)
-    frame.alpha_composite(shade)
-    fx=Image.new('RGBA',(W,H)); d=ImageDraw.Draw(fx)
-    # Fine orbiting time marks frame the symbolic portrait.
-    cx,cy=540,485
-    for k in range(96):
-        a=2*math.pi*k/96+t*.025
-        r=445; leng=12 if k%8==0 else 4
-        d.line((cx+math.cos(a)*r,cy+math.sin(a)*r,cx+math.cos(a)*(r+leng),cy+math.sin(a)*(r+leng)),fill=(212,175,100,105 if k%8==0 else 45),width=2 if k%8==0 else 1)
-    if name=='origin':
-        # Expanding orbit wavefronts suggest the birth and infinity of time.
+def vortex(d,t,scale=1):
+    for radius,phase,vel,size,tint in particles:
+        r=25+radius**.6*365*scale
+        a=phase*math.tau+t*(.13+vel*.25)+radius*6
+        # Long curved streaks have an actual head and trailing path.
+        pts=[]
+        for k in range(5):
+            b=a-k*.012*(1+vel*2)
+            pts.append((540+math.cos(b)*r,430+math.sin(b)*r*.76))
+        col=WHITE if tint>.8 else GOLD
+        d.line(pts,fill=rgba(col,65+size*160),width=1+int(size*1.7))
+    for j in range(3):
+        r=14+j*7+3*math.sin(t*1.5)
+        d.ellipse((540-r,430-r,540+r,430+r),outline=rgba(GOLD,160-j*40),width=2)
+
+def hourglass(d,t):
+    cx=540; top=170; bottom=710; half=220
+    # The glass silhouette stays rigid; sand really moves inside it.
+    for sign in [-1,1]:
+        pts=[]
+        for k in range(101):
+            u=k/100; y=top+(bottom-top)*u
+            width=14+half*abs(2*u-1)**.76
+            pts.append((cx+sign*width,y))
+        d.line(pts,fill=rgba(GOLD,205),width=3)
+    for y in [top-13,bottom+13]:
+        d.rounded_rectangle((cx-half-20,y-5,cx+half+20,y+5),radius=4,fill=rgba(GOLD,220))
+        d.line((cx-half-35,y+14,cx+half+35,y+14),fill=rgba(GOLD,70),width=1)
+    for u,v,speed,size,tint in particles:
+        phase=(v+t*(.15+speed*.12))%1
+        if phase<.43:
+            q=phase/.43; y=top+35+q*225; width=(1-q)*170+6
+            x=cx+(u-.5)*2*width
+        elif phase<.72:
+            q=(phase-.43)/.29;y=430+q*230;x=cx+(u-.5)*9+math.sin(q*9+t)*2
+        else:
+            q=(phase-.72)/.28;y=660+q*38;x=cx+(u-.5)*(100+q*220)
+        rr=.8+size*1.4
+        d.ellipse((x-rr,y-rr,x+rr,y+rr),fill=rgba(WHITE if tint>.85 else GOLD,130+size*120))
+    # A growing breathing dune; outlines emphasize volume.
+    for j in range(8):
+        pts=[]
+        for k in range(81):
+            x=390+k*300/80; y=698-48*max(0,1-abs(x-540)/150)+j*1.7+2*math.sin(t*.7)
+            pts.append((x,y))
+        d.line(pts,fill=rgba(GOLD,35+j*12),width=1)
+
+def duality(d,t,local):
+    # Opposing animated ribbons assembled from hundreds of independent particles.
+    for side,color in [(-1,GOLD),(1,BLUE)]:
         for j in range(7):
-            radius=35+((t*24+j*76)%530)
-            alpha=int(100*(1-radius/600))
-            d.ellipse((540-radius,450-radius,540+radius,450+radius),outline=(219,180,104,alpha),width=2)
+            pts=[]
+            for k in range(145):
+                u=k/144
+                angle=u*math.tau*1.25+t*.4*side+j*.045
+                radius=40+u*325
+                x=540+side*math.cos(angle)*radius
+                y=440+math.sin(angle)*radius*.84
+                pts.append((x,y))
+            d.line(pts,fill=rgba(color,30+j*18),width=2)
+        for u,v,vel,size,tint in particles[::2]:
+            q=(v+t*(.04+vel*.025))%1
+            angle=q*math.tau*1.25+t*.4*side
+            rad=40+q*325+(u-.5)*40
+            x=540+side*math.cos(angle)*rad;y=440+math.sin(angle)*rad*.84
+            r=.8+size*2
+            d.ellipse((x-r,y-r,x+r,y+r),fill=rgba(color,90+size*155))
+    d.ellipse((530,430,550,450),fill=rgba(WHITE,230))
+
+def branches(d,t,local):
+    # A visual metaphor for a plurality of traditions, not a historical chart.
+    trunk=(540,615)
+    nodes=[(235,300),(405,250),(675,250),(845,300)]
+    growth=smooth(local/2)
+    d.line((540,715,540,615),fill=rgba(GOLD,180),width=3)
+    for j,(x,y) in enumerate(nodes):
+        end=(540+(x-540)*growth,615+(y-615)*growth)
+        pts=[]
+        for k in range(61):
+            u=k/60; pts.append((540+(end[0]-540)*u,615+(end[1]-615)*(u*u*(3-2*u))))
+        col=GOLD if j==1 else BLUE
+        d.line(pts,fill=rgba(col,160 if j==1 else 65),width=3 if j==1 else 1)
+        rad=8+2*math.sin(t*1.5+j)
+        d.ellipse((end[0]-rad,end[1]-rad,end[0]+rad,end[1]+rad),outline=rgba(col,200),width=2)
+        for n in range(6):
+            q=(n/6+t*.13)%1
+            px=540+(end[0]-540)*q;py=615+(end[1]-615)*smooth(q)
+            d.ellipse((px-2,py-2,px+2,py+2),fill=rgba(col,200))
+    label(d,'روایت‌های اندیشهٔ ایرانی',540,166,27,GOLD)
+
+def sphere(d,t):
+    # A rotating celestial globe projected from actual 3D coordinates.
+    rot=t*.18
+    def project(x,y,z):
+        xx=x*math.cos(rot)+z*math.sin(rot);zz=-x*math.sin(rot)+z*math.cos(rot)
+        yy=y*.93-zz*.25; depth=1+zz*.0003
+        return (540+xx/depth,440+yy/depth),zz
+    for latitude in range(-60,90,15):
+        lat=math.radians(latitude); pts=[]
+        for k in range(181):
+            a=k*math.tau/180
+            pt,z=project(290*math.cos(lat)*math.cos(a),290*math.sin(lat),290*math.cos(lat)*math.sin(a))
+            pts.append(pt)
+        d.line(pts,fill=rgba(GOLD,75),width=1)
+    for j in range(12):
+        pts=[]
+        for k in range(181):
+            a=k*math.tau/180;lon=j*math.pi/12
+            pt,z=project(290*math.cos(a)*math.cos(lon),290*math.sin(a),290*math.cos(a)*math.sin(lon));pts.append(pt)
+        d.line(pts,fill=rgba(BLUE,65),width=1)
+    orbit(d,t,scale=1.12)
+    for u,v,z,size,ph in stars[::3]:
+        a=u*math.tau; lat=(v-.5)*math.pi
+        p,depth=project(292*math.cos(lat)*math.cos(a),292*math.sin(lat),292*math.cos(lat)*math.sin(a))
+        if depth<0:
+            r=1+size*1.5;d.ellipse((p[0]-r,p[1]-r,p[0]+r,p[1]+r),fill=rgba(WHITE,210))
+
+# Cached gradient: keep the entire lower text-safe area dark.
+g=np.zeros((1080,1080,4),dtype=np.uint8)
+for y in range(1080):g[y,:,3]=int(max(0,min(1,(y-610)/390))*230)
+SHADE=Image.fromarray(g)
+
+def frame_at(t):
+    idx=next(i for i,(a,b,*_) in enumerate(SHOTS) if a<=t<b)
+    a,b,kind,title,sub=SHOTS[idx];local=t-a
+    frame=BACKGROUND.copy()
+    if kind in ('portrait','ruins'):
+        name='zurvan' if kind=='portrait' else 'world';u=local/(b-a)
+        side=int(1080/(1.02+.09*smooth(u)));x=int((1080-side)*(.25+.5*u));y=int((1080-side)*.35)
+        art=ART[name].resize((1080,1080)).crop((x,y,x+side,y+side)).resize((1080,1080),Image.Resampling.BICUBIC).convert('RGBA')
+        frame=Image.blend(frame,art,.92)
+    fine=Image.new('RGBA',(1080,1080));d=ImageDraw.Draw(fine)
+    starfield(d,t,1.0 if kind not in ('portrait','ruins') else .65)
+    if kind=='seed':
+        progress=smooth(local/3)
+        for j in range(12):
+            radius=10+j*19+progress*95
+            d.ellipse((540-radius,430-radius,540+radius,430+radius),outline=rgba(GOLD,(1-j/14)*100),width=1)
+        for j in range(8):
+            r=4+j*3;d.ellipse((540-r,430-r,540+r,430+r),fill=rgba(WHITE,25))
+        orbit(d,t,scale=.45+progress*.2)
+    elif kind=='vortex':vortex(d,t)
+    elif kind=='hourglass':hourglass(d,t);orbit(d,t,scale=1.16)
+    elif kind=='duality':duality(d,t,local)
+    elif kind=='branches':branches(d,t,local)
+    elif kind=='sphere':sphere(d,t)
+    elif kind=='ending':vortex(d,t,scale=.86);orbit(d,t,scale=.9)
+    elif kind=='portrait':
+        # Animated luminous ring passing in front of the portrait.
         for j in range(3):
-            a=t*.18+j*2.094
-            px=540+math.cos(a)*310;py=450+math.sin(a)*150
-            d.ellipse((px-3,py-3,px+3,py+3),fill=(255,227,161,210))
-    elif name=='duality':
-        # Opposing currents: distinct warm and cool moving particle streams.
-        for j in range(100):
-            u=(j/100+t*.06)%1
-            yy=150+u*570
-            sway=90*math.sin(u*5+t*.35)
-            for xx,col in [(340+sway,(255,211,132,150)),(740-sway,(160,170,248,125))]:
-                r=1+(j%3)*.6
-                d.ellipse((xx-r,yy-r,xx+r,yy+r),fill=col)
-    elif name=='world':
-        # Falling golden grains over the ruins, independent of camera movement.
-        for j in range(120):
-            xx=80+(j*71)%920
-            yy=180+((j*83+t*(18+j%17))%590)
-            d.line((xx,yy,xx-3,yy+5),fill=(232,191,119,55+j%65),width=1)
-    for sx,sy,r,ph,speed in stars:
-        yy=60+(sy-60-t*speed*.15)%740
-        alpha=int(55+130*(.5+.5*math.sin(t*.7+ph)))
-        d.ellipse((sx-r,yy-r,sx+r,yy+r),fill=(255,222,159,alpha))
-    d.rectangle((38,38,1042,1042),outline=(200,165,99,65),width=1)
-    text(d,'ایرانِ اسطوره‌ای',61,20,(222,202,161,190))
-    frame.alpha_composite(fx)
-    for start,end,card in cards:
-        if start<=t<end:
-            opacity=min(1,(t-start)/.6,(end-t)/.6)
-            temp=card.copy();temp.putalpha(card.getchannel('A').point(lambda a:int(a*max(0,opacity))))
-            frame.alpha_composite(temp)
-            break
-    fade=min(1,t/1.3,(60-t)/1.1)
-    if fade<1: frame=Image.blend(Image.new('RGBA',(W,H),(5,9,18,255)),frame,max(0,fade))
-    if n==9*FPS: frame.convert('RGB').save('deliverables/cover.jpg',quality=95)
-    if n in [4*FPS,12*FPS,23*FPS,46*FPS]: frame.convert('RGB').save(f'deliverables/scene-{int(t):02d}.jpg',quality=91)
-    p.stdin.write(frame.convert('RGB').tobytes())
-    if n%240==0: print(f'{t:.0f}/60 seconds',flush=True)
-p.stdin.close()
-if p.wait()!=0: raise RuntimeError('Encoding failed; see render.log')
-print('DONE',flush=True)
+            pts=[]
+            for k in range(161):
+                ang=k*math.tau/160
+                pts.append((540+math.cos(ang)*(360+j*5),475+math.sin(ang)*(360+j*5)))
+            d.line(pts,fill=rgba(GOLD,65-j*20),width=1)
+        for n in range(12):
+            ang=t*.22+n*math.tau/12;px=540+math.cos(ang)*360;py=475+math.sin(ang)*360
+            d.ellipse((px-2,py-2,px+2,py+2),fill=rgba(GOLD,190))
+    elif kind=='ruins':
+        for u,v,speed,size in dust:
+            x=(u*1200+t*(15+speed*15))%1200-60;y=150+(v*650+t*(16+speed*30))%660
+            d.line((x,y,x-7,y-4),fill=rgba(GOLD,50+size*90),width=1)
+    # Emissive elements receive a bloom pass, then their sharp core.
+    glow=fine.resize((360,360)).filter(ImageFilter.GaussianBlur(5)).resize((1080,1080))
+    frame.alpha_composite(glow);frame.alpha_composite(fine)
+    frame.alpha_composite(SHADE)
+    ui=Image.new('RGBA',(1080,1080));d=ImageDraw.Draw(ui)
+    d.line((65,90,235,90),fill=rgba(GOLD,140),width=1)
+    label(d,'روایتِ زمان',1015,65,23,rgba(GOLD,210),'rt')
+    # Draw-on ornaments lead the eye into the title.
+    enter=smooth(local/.65);leave=smooth((b-t)/.35)
+    span=90*enter
+    d.line((540-span,800,540+span,800),fill=rgba(GOLD,200),width=2)
+    offset=22*(1-enter)
+    if kind=='ending':
+        label(d,title,540,816+offset,112,WHITE)
+        label(d,sub,540,958+offset,27,GOLD)
+    else:
+        size=76 if title=='زَروان' else 44
+        label(d,title,540,836+offset,size,WHITE)
+        if sub:label(d,sub,540,936+offset,27,GOLD)
+    # A restrained timeline makes the one-minute structure tangible.
+    d.line((65,1020,1015,1020),fill=rgba(GOLD,35),width=1)
+    d.line((65,1020,65+950*t/60,1020),fill=rgba(GOLD,165),width=2)
+    ui.putalpha(ui.getchannel('A').point(lambda x:int(x*enter*leave)))
+    frame.alpha_composite(ui)
+    # Short dip-through-ink separates the visual acts; every shot has its own motion.
+    transition=min(1,local/.22,(b-t)/.18)
+    fade=min(transition,smooth(t/.8),smooth((60-t)/1.0))
+    if fade<1:frame=Image.blend(BACKGROUND,frame,max(0,fade))
+    return frame.convert('RGB')
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--preview',type=float);args=parser.parse_args()
+    output=ROOT/'deliverables';output.mkdir(exist_ok=True)
+    if args.preview is not None:
+        frame_at(args.preview).save(output/'preview.jpg',quality=94);return
+    ff=imageio_ffmpeg.get_ffmpeg_exe()
+    cmd=[ff,'-y','-f','rawvideo','-vcodec','rawvideo','-pix_fmt','rgb24','-s','1080x1080','-r','24','-i','-','-i','assets/audio/narration.flac','-filter_complex','[1:a]adelay=700|700,apad,afade=t=out:st=59:d=1[a]','-map','0:v','-map','[a]','-t','60','-c:v','libx264','-preset','fast','-crf','19','-pix_fmt','yuv420p','-c:a','aac','-b:a','192k','-movflags','+faststart',str(output/'zurvan-instagram.mp4')]
+    with open(ROOT/'render.log','w') as log:
+        p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=log)
+        try:
+            for n in range(1440):
+                t=n/24;frame=frame_at(t)
+                if n==9*24:frame.save(output/'cover.jpg',quality=95)
+                if n in [4*24,12*24,23*24,46*24]:frame.save(output/f'scene-{int(t):02d}.jpg',quality=92)
+                p.stdin.write(frame.tobytes())
+                if n%240==0:print(f'{int(t)}/60',flush=True)
+        finally:p.stdin.close()
+        if p.wait():raise RuntimeError('See render.log')
+    print('DONE',flush=True)
+if __name__=='__main__':main()
